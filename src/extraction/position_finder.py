@@ -8,11 +8,11 @@ from src.agent.browser import BrowserSession
 from src.agent.llm import LLMClient
 from src.extraction.ats_clients import get_position_via_ats
 from src.models import ExtractionMethod, JobLead, StageResult, StageStatus
+from src.utils.http import CachedHttpClient
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Patterns that indicate a placeholder or generic form rather than a real requisition.
 _JUNK_PATTERNS = re.compile(
     r"(register|signup|sign-up|login|apply-general|general-application|#$)",
     re.IGNORECASE,
@@ -20,9 +20,16 @@ _JUNK_PATTERNS = re.compile(
 
 
 class PositionFinder:
-    def __init__(self, llm: LLMClient, browser: BrowserSession, timeout: int = 30):
+    def __init__(
+        self,
+        llm: LLMClient,
+        browser: BrowserSession,
+        http: CachedHttpClient,
+        timeout: int = 30,
+    ):
         self._llm = llm
         self._browser = browser
+        self._http = http
         self._timeout = timeout
 
     async def find(self, lead: JobLead) -> JobLead:
@@ -33,27 +40,24 @@ class PositionFinder:
             return lead
 
         try:
-            # 1. Try ATS public JSON API first (fastest, most reliable).
-            url = await get_position_via_ats(lead.career_url, self._timeout)
-            if url:
+            url = await get_position_via_ats(lead.career_url, self._http, self._timeout)
+            if url and await self._validate_position_url(url):
                 lead.position_url = url
                 lead.extraction_result = StageResult(
                     status=StageStatus.ok, method=ExtractionMethod.ats_api
                 )
                 return lead
 
-            # 2. Render the page and extract links via DOM.
             url = await self._dom_extract(lead.career_url)
-            if url:
+            if url and await self._validate_position_url(url):
                 lead.position_url = url
                 lead.extraction_result = StageResult(
                     status=StageStatus.ok, method=ExtractionMethod.dom
                 )
                 return lead
 
-            # 3. LLM fallback: let Claude pick from page content.
             url = await self._llm_extract(lead.career_url)
-            if url:
+            if url and await self._validate_position_url(url):
                 lead.position_url = url
                 lead.extraction_result = StageResult(
                     status=StageStatus.ok, method=ExtractionMethod.llm
@@ -61,7 +65,7 @@ class PositionFinder:
                 return lead
 
             lead.extraction_result = StageResult(
-                status=StageStatus.failed, error="no open position found"
+                status=StageStatus.partial, error="no open position found"
             )
         except Exception as exc:
             logger.error("extraction failed for %s: %s", lead.career_url, exc)
@@ -69,9 +73,16 @@ class PositionFinder:
 
         return lead
 
+    async def _validate_position_url(self, url: str) -> bool:
+        if not await self._http.is_reachable(url):
+            logger.warning("position URL failed validation: %s", url)
+            return False
+        return True
+
     async def _dom_extract(self, career_url: str) -> Optional[str]:
         html = await self._browser.fetch(career_url)
         from selectolax.parser import HTMLParser
+
         tree = HTMLParser(html)
         for node in tree.css("a[href]"):
             href = node.attributes.get("href", "")
@@ -83,6 +94,7 @@ class PositionFinder:
     async def _llm_extract(self, career_url: str) -> Optional[str]:
         html = await self._browser.fetch(career_url)
         from selectolax.parser import HTMLParser
+
         tree = HTMLParser(html)
         links = [
             node.attributes.get("href", "")
@@ -106,6 +118,5 @@ class PositionFinder:
         if _JUNK_PATTERNS.search(url):
             return False
         path = urlparse(url).path
-        # Must have some path depth suggesting a specific requisition.
         parts = [p for p in path.split("/") if p]
         return len(parts) >= 2
